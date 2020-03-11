@@ -1,13 +1,18 @@
 from typing import Any, Callable, Dict, List, Tuple
-from pathos.pools import ThreadPool as TPool
-from copy import deepcopy
+# from copy import deepcopy
 from functools import reduce
+# import cProfile
+import pickle
 
 from cadCAD.engine.utils import engine_exception
 from cadCAD.utils import flatten
 
 id_exception: Callable = engine_exception(KeyError, KeyError, None)
 
+# pickle is faster than deepcopy
+# details at https://stackoverflow.com/questions/24756712/deepcopy-is-extremely-slow
+def deepcopy(a):
+    return pickle.loads(pickle.dumps(a, -1))
 
 class Executor:
     def __init__(
@@ -94,6 +99,12 @@ class Executor:
 
         return state_dict
 
+    def generate_record(self, state_funcs, sweep_dict, sub_step, sH, last_in_obj, _input):
+        for f in state_funcs:
+            # yield self.state_update_exception(f(sweep_dict, sub_step, sH, last_in_obj, _input))
+            yield f(sweep_dict, sub_step, sH, last_in_obj, _input)
+
+
     # mech_step
     def partial_state_update(
                 self,
@@ -109,23 +120,14 @@ class Executor:
             ) -> List[Dict[str, Any]]:
 
         last_in_obj: Dict[str, Any] = deepcopy(sL[-1])
-        _input: Dict[str, Any] = self.policy_update_exception(
-            self.get_policy_input(sweep_dict, sub_step, sH, last_in_obj, policy_funcs)
+        _input: Dict[str, Any] = self.get_policy_input(sweep_dict, sub_step, sH, last_in_obj, policy_funcs)
+
+        last_in_copy: Dict[str, Any] = transfer_missing_fields(
+            last_in_obj,
+            dict(
+                self.generate_record(state_funcs, sweep_dict, sub_step, sH, last_in_obj, _input)
+            )
         )
-
-
-        def generate_record(state_funcs):
-            for f in state_funcs:
-                yield self.state_update_exception(f(sweep_dict, sub_step, sH, last_in_obj, _input))
-
-        def transfer_missing_fields(source, destination):
-            for k in source:
-                if k not in destination:
-                    destination[k] = source[k]
-            del source # last_in_obj
-            return destination
-
-        last_in_copy: Dict[str, Any] = transfer_missing_fields(last_in_obj, dict(generate_record(state_funcs)))
         last_in_copy: Dict[str, Any] = self.apply_env_proc(sweep_dict, env_processes, last_in_copy)
         last_in_copy['substep'], last_in_copy['timestep'], last_in_copy['run'] = sub_step, time_step, run
 
@@ -163,7 +165,15 @@ class Executor:
         for [s_conf, p_conf] in configs: # tensor field
 
             states_list: List[Dict[str, Any]] = self.partial_state_update(
-                sweep_dict, sub_step, states_list, simulation_list, s_conf, p_conf, env_processes, time_step, run
+                sweep_dict,
+                sub_step,
+                states_list,
+                simulation_list,
+                s_conf,
+                p_conf,
+                env_processes,
+                time_step,
+                run
             )
             sub_step += 1
 
@@ -194,6 +204,28 @@ class Executor:
             simulation_list.append(pipe_run)
 
         return simulation_list
+    
+    def execute_run(
+            self,
+            sweep_dict,
+            states_list,
+            configs,
+            env_processes,
+            time_seq,
+            run
+    ) -> List[Dict[str, Any]]:
+        run += 1
+
+        states_list_copy: List[Dict[str, Any]] = list(
+            generate_init_sys_metrics(deepcopy(states_list), run)
+        )
+
+        first_timestep_per_run: List[Dict[str, Any]] = self.run_pipeline(
+            sweep_dict, states_list_copy, configs, env_processes, time_seq, run
+        )
+        del states_list_copy
+        
+        return first_timestep_per_run
 
     def simulation(
             self,
@@ -205,30 +237,30 @@ class Executor:
             runs: int
         ) -> List[List[Dict[str, Any]]]:
 
-        def execute_run(sweep_dict, states_list, configs, env_processes, time_seq, run) -> List[Dict[str, Any]]:
-            run += 1
+        
+        # p = cProfile.Profile();
+        # p.enable(); 
+        
+        result = flatten(list(map(
+            lambda run: self.execute_run(sweep_dict, states_list, configs, env_processes, time_seq, run),
+            list(range(runs))
+        )))
+        
+        # p.print_stats('cumulative')
+        
+        return result
 
-            def generate_init_sys_metrics(genesis_states_list):
-                for d in genesis_states_list:
-                    d['run'], d['substep'], d['timestep'] = run, 0, 0
-                    yield d
 
-            states_list_copy: List[Dict[str, Any]] = list(generate_init_sys_metrics(deepcopy(states_list)))
+def generate_init_sys_metrics(genesis_states_list, run):
+    for d in genesis_states_list:
+        d['run'], d['substep'], d['timestep'] = run, 0, 0
+        yield d
 
-            first_timestep_per_run: List[Dict[str, Any]] = self.run_pipeline(
-                sweep_dict, states_list_copy, configs, env_processes, time_seq, run
-            )
-            del states_list_copy
+    
+def transfer_missing_fields(source, destination):
+    for k in source:
+        if k not in destination:
+            destination[k] = source[k]
+    del source # last_in_obj
+    return destination
 
-            return first_timestep_per_run
-
-        tp = TPool(runs)
-        pipe_run: List[List[Dict[str, Any]]] = flatten(
-            tp.map(
-                lambda run: execute_run(sweep_dict, states_list, configs, env_processes, time_seq, run),
-                list(range(runs))
-            )
-        )
-
-        tp.clear()
-        return pipe_run
